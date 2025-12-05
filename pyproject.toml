@@ -6,8 +6,10 @@ readme = "README.md"
 authors = [
     { name = "Steven Hé (Sīchàng)", email = "stevensichanghe@gmail.com" }
 ]
-requires-python = ">=3.12"
-dependencies = []
+requires-python = ">=3.13"
+dependencies = [
+    "aio-sync>=0.1.1",
+]
 
 [build-system]
 requires = ["uv_build>=0.9.15,<0.10.0"]
