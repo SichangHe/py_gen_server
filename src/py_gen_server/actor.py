@@ -1,96 +1,73 @@
 from __future__ import annotations
 
 import asyncio
-from abc import ABC, abstractmethod
 from asyncio import QueueShutDown, Task
 from dataclasses import dataclass
+from typing import Protocol
 
 from aio_sync.mpmc import MPMCReceiver, MPMCSender, mpmc_channel
 from aio_sync.oneshot import OneShot
 
 
-# FIXME: unnecessary. just let actor return None | Exception
+# FIXME: copy all docstings from tokio_gen_server and adjust where needed
 @dataclass(slots=True)
-class HandleResult[R]:
-    """Handler outcome with optional reply and stop control."""
+class ActorCall[Call, Reply]:
+    """Request expecting a reply."""
 
-    reply: R | None = None
-    should_stop: bool = False
-
-    @classmethod
-    def cont(cls, reply: R | None = None) -> HandleResult[R]:
-        return cls(reply=reply, should_stop=False)
-
-    @classmethod
-    def stop(cls, reply: R | None = None) -> HandleResult[R]:
-        return cls(reply=reply, should_stop=True)
+    msg: Call
+    reply_to: OneShot[Reply | Exception | None]
 
 
-# FIXME: separate to ActorCall, etc. and provide a type alias for union
-class ActorMsg:
-    # FIXME: Use full name for generic arguments
-    @dataclass(slots=True)
-    class Call[C, R]:
-        msg: C
-        reply_to: OneShot[R]
+@dataclass(slots=True)
+class ActorCast[Cast]:
+    """Fire-and-forget message."""
 
-    @dataclass(slots=True)
-    class Cast[C]:
-        msg: C
-
-    @dataclass(slots=True)
-    class Reply[R]:
-        msg: R
+    msg: Cast
 
 
-class Actor[Call, Cast, Reply](ABC):
-    """Abstract actor matching the Rust trait surface."""
+type ActorMsg[Call, Cast, Reply] = ActorCall[Call, Reply] | ActorCast[Cast]
+"""Message to be delivered to an actor, either call or cast."""
 
-    # FIXME: should not be inside Actor, but should be in ActorRef
-    gs_self_task: Task[None] | None
 
-    def __init__(self) -> None:
-        self.gs_self_task = None
+class Actor[Call, Cast, Reply](Protocol):
+    """Async actor interface for building Erlang-style generic servers."""
 
-    # FIXME: write docstrings w/ examples for every public thing
     async def init(self) -> None:
         return None
 
-    @abstractmethod
-    async def handle_call(self, msg: Call) -> HandleResult[Reply]: ...
+    async def handle_call(self, msg: Call) -> Reply | None:
+        ...
 
-    @abstractmethod
-    async def handle_cast(self, msg: Cast) -> HandleResult[Reply]: ...
+    async def handle_cast(self, msg: Cast) -> Reply | None:
+        ...
 
     async def before_exit(self) -> None:
         return None
 
-    # FIXME: match signatures of all tokio_gen_server Actor-related trait methods
-    async def _run(
+    async def _serve(
         self,
-        receiver: MPMCReceiver[
-            ActorMsg.Call[Call, Reply] | ActorMsg.Cast[Cast] | ActorMsg.Reply[Reply]
-        ],
+        receiver: MPMCReceiver[ActorMsg[Call, Cast, Reply]],
+        ref: ActorRef[Call, Cast, Reply],
     ) -> None:
-        self.gs_self_task = asyncio.current_task()
+        task = asyncio.current_task()
+        ref.task4actor = task
         await self.init()
         try:
             while True:
-                env = await receiver.recv()
+                try:
+                    env = await receiver.recv()
+                except QueueShutDown:
+                    break
                 match env:
-                    case QueueShutDown():
-                        break
-                    case ActorMsg.Call(msg=msg, reply_to=reply_to):
-                        result = await self.handle_call(msg)
-                        reply_to.send(result.reply)
-                        if result.should_stop:
-                            break
-                    case ActorMsg.Cast(msg=msg):
-                        result = await self.handle_cast(msg)
-                        if result.should_stop:
-                            break
-                    case ActorMsg.Reply():
-                        continue
+                    case ActorCall(msg=msg, reply_to=reply_to):
+                        try:
+                            reply = await self.handle_call(msg)
+                        except Exception as err:
+                            reply_to.send(err)
+                        else:
+                            reply_to.send(reply)
+                    case ActorCast(msg=msg):
+                        await self.handle_cast(msg)
         except asyncio.CancelledError:
             pass
         finally:
@@ -98,87 +75,65 @@ class Actor[Call, Cast, Reply](ABC):
             try:
                 await self.before_exit()
             finally:
-                self.gs_self_task = None
-
-    # FIXME: do not use a classmethod here! spawn an already constructed actor
-    @classmethod
-    def spawn(
-        cls, *args, **kwargs
-    ) -> tuple[ActorRef[Call, Cast, Reply], ActorJoinHandle[Call, Cast, Reply]]:
-        actor: Actor[Call, Cast, Reply] = cls(*args, **kwargs)
-        sender, receiver = mpmc_channel()
-        task = asyncio.create_task(actor._run(receiver))
-        return ActorRef(sender), ActorJoinHandle(actor, task)
+                self.gs_self = None
+                ref.task4actor = None
 
 
+@dataclass(slots=True)
 class ActorRef[Call, Cast, Reply]:
-    """User handle to interact w a running actor."""
+    """A reference to an instance of `Actor`, to cast or call messages on it or
+    cancel it."""
 
-    sender: MPMCSender[
-        ActorMsg.Call[Call, Reply] | ActorMsg.Cast[Cast] | ActorMsg.Reply[Reply]
-    ]
-
-    def __init__(
-        self,
-        sender: MPMCSender[
-            ActorMsg.Call[Call, Reply] | ActorMsg.Cast[Cast] | ActorMsg.Reply[Reply]
-        ],
-    ) -> None:
-        self.sender = sender
+    msg_sender: MPMCSender[ActorMsg[Call, Cast, Reply]]
+    # TODO: Should return something
+    task4actor: Task[None]
 
     async def cast(self, msg: Cast) -> QueueShutDown | None:
-        err = await self.sender.send(ActorMsg.Cast(msg))
+        return await self.msg_sender.send(ActorCast(msg))
+
+    async def call(self, msg: Call) -> Reply | QueueShutDown | Exception | None:
+        reply_to = OneShot[Reply | Exception | None]()
+        err = await self.msg_sender.send(ActorCall(msg, reply_to))
         if isinstance(err, QueueShutDown):
             return err
-        return None
-
-    async def call(self, msg: Call) -> tuple[Reply | None, QueueShutDown | None]:
-        reply = OneShot[Reply]()
-        err = await self.sender.send(ActorMsg.Call(msg, reply))
-        if isinstance(err, QueueShutDown):
-            return None, err
-        return await reply.recv(), None
+        wait_for: set[asyncio.Future[Reply | Exception | None] | Task[None]] = {
+            reply_to.future
+        }
+        task = self.task4actor
+        if task is not None:
+            wait_for.add(task)
+        done, _ = await asyncio.wait(wait_for, return_when=asyncio.FIRST_COMPLETED)
+        if reply_to.future in done:
+            return await reply_to.recv()
+        return QueueShutDown()
 
     async def relay_call(
-        self, msg: Call, reply_to: OneShot[Reply]
+        self, msg: Call, reply_to: OneShot[Reply | Exception | None]
     ) -> QueueShutDown | None:
-        err = await self.sender.send(ActorMsg.Call(msg, reply_to))
+        """Forward a call using an existing reply path."""
+
+        err = await self.msg_sender.send(ActorCall(msg, reply_to))
         if isinstance(err, QueueShutDown):
             return err
         return None
 
-    def blocking_cast(self, msg: Cast) -> QueueShutDown | None:
-        return asyncio.run(self.cast(msg))
+    def blocking_call(self, msg: Call) -> Reply | Exception | QueueShutDown | None:
+        """Run `call` in a new event loop."""
 
-    def blocking_call(self, msg: Call) -> tuple[Reply | None, QueueShutDown | None]:
         return asyncio.run(self.call(msg))
 
-    # FIXME: def cancel
+    def cancel(self) -> None:
+        """Cancel the actor task without waiting."""
 
-
-# FIXME: unnecessary, replace with bare `Task`
-class ActorJoinHandle[Call, Cast, Reply]:
-    """Join handle for observing and controlling a running actor."""
-
-    actor: Actor[Call, Cast, Reply]
-    task: Task[None]
-
-    def __init__(self, actor: Actor[Call, Cast, Reply], task: Task[None]) -> None:
-        self.actor = actor
-        self.task = task
-
-    async def cancel(self) -> None:
-        task = self.actor.gs_self_task
+        task = self.task4actor
         if task is None or task.done():
             return None
         task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            return None
 
     async def wait(self) -> None:
-        task = self.actor.gs_self_task or self.task
+        """Wait for the actor task to finish."""
+
+        task = self.task4actor
         if task is None:
             return None
         try:
@@ -187,5 +142,30 @@ class ActorJoinHandle[Call, Cast, Reply]:
             return None
 
     def is_alive(self) -> bool:
-        task = self.actor.gs_self_task or self.task
+        """Return True while the actor task is active."""
+
+        task = self.task4actor
         return task is not None and not task.done()
+
+
+def spawn[Call, Cast, Reply](
+    actor: Actor[Call, Cast, Reply],
+    /,
+    sender: MPMCSender[ActorMsg[Call, Cast, Reply]] | None = None,
+    receiver: MPMCReceiver[ActorMsg[Call, Cast, Reply]] | None = None,
+    *,
+    task_group: asyncio.TaskGroup | None = None,
+) -> tuple[ActorRef[Call, Cast, Reply], Task[None]]:
+    """Start an actor with explicit channels, mirroring `spawn` in Rust."""
+
+    if (sender is None) != (receiver is None):
+        raise ValueError("provide sender and receiver together")
+    if sender is None or receiver is None:
+        sender, receiver = mpmc_channel()
+    ref = ActorRef(sender, actor)
+    if task_group is None:
+        task = asyncio.create_task(actor._serve(receiver, ref))
+    else:
+        task = task_group.create_task(actor._serve(receiver, ref))
+    ref.task4actor = task
+    return ref, task

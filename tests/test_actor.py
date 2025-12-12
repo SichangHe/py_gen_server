@@ -1,98 +1,74 @@
 import asyncio
 import unittest
+from asyncio import QueueShutDown
 
-from py_gen_server import Actor, HandleResult
+from aio_sync.mpmc import mpmc_channel
+from py_gen_server import Actor, spawn
 
 
-# TODO: demonstrate custom union types as message types instead of str
-# use `match`
 class Recorder(Actor[str, str, str]):
     def __init__(self) -> None:
         super().__init__()
         self.log: list[str] = []
 
-    async def handle_call(self, msg: str) -> HandleResult[str]:
-        self.log.append(msg)
-        if msg == "stop":
-            return HandleResult.stop("bye")
-        return HandleResult.cont(msg)
+    async def init(self) -> None:
+        self.log.append("init")
 
-    async def handle_cast(self, msg: str) -> HandleResult[str]:
-        self.log.append(msg)
-        return HandleResult.cont()
+    async def handle_call(self, msg: str) -> str | None:
+        self.log.append(f"call:{msg}")
+        return msg.upper()
 
-    async def before_exit(self) -> None:
-        self.log.append("exit")
+    async def handle_cast(self, msg: str) -> str | None:
+        self.log.append(f"cast:{msg}")
+        return None
 
+    async def handle_info(self, msg: object) -> str | None:
+        self.log.append(f"info:{msg}")
+        return None
 
-class Counter(Actor[str, str, int]):
-    def __init__(self) -> None:
-        super().__init__()
-        self.n = 0
-
-    async def handle_call(self, msg: str) -> HandleResult[int]:
-        if msg == "get":
-            return HandleResult.cont(self.n)
-        return HandleResult.stop(self.n)
-
-    async def handle_cast(self, msg: str) -> HandleResult[int]:
-        if msg == "inc":
-            self.n += 1
-            return HandleResult.cont(self.n)
-        return HandleResult.stop(self.n)
-
-    async def before_exit(self) -> None:
-        self.n += 100
+    async def terminate(self) -> None:
+        self.log.append("term")
 
 
-class Cancelled(Actor[int, int, int]):
-    def __init__(self) -> None:
-        super().__init__()
-        self.cleaned = False
+class Echo(Actor[int, int, int]):
+    async def handle_call(self, msg: int) -> int | None:
+        return msg
 
-    async def handle_call(self, msg: int) -> HandleResult[int]:
-        await asyncio.sleep(0)
-        return HandleResult.cont(msg)
-
-    async def handle_cast(self, msg: int) -> HandleResult[int]:
-        await asyncio.sleep(0)
-        return HandleResult.cont(msg)
-
-    async def before_exit(self) -> None:
-        self.cleaned = True
+    async def handle_cast(self, msg: int) -> int | None:
+        return None
 
 
 class ActorTests(unittest.IsolatedAsyncioTestCase):
-    async def test_call_and_stop_message(self) -> None:
-        ref, join = Recorder.spawn()
-        reply, err = await ref.call("hello")
-        self.assertIsNone(err)
-        self.assertEqual(reply, "hello")
-        reply, err = await ref.call("stop")
-        self.assertIsNone(err)
-        self.assertEqual(reply, "bye")
-        await join.wait()
-        self.assertEqual(join.actor.log, ["hello", "stop", "exit"])
-
-    async def test_cast_and_state(self) -> None:
-        ref, join = Counter.spawn()
-        self.assertIsNone(await ref.cast("inc"))
-        self.assertIsNone(await ref.cast("inc"))
-        reply, err = await ref.call("get")
-        self.assertIsNone(err)
-        self.assertEqual(reply, 2)
-        reply, err = await ref.call("halt")
-        self.assertIsNone(err)
-        self.assertEqual(reply, 2)
-        await join.wait()
-        self.assertEqual(join.actor.n, 102)
-
-    async def test_stop_cancels_and_cleans(self) -> None:
-        ref, join = Cancelled.spawn()
-        self.assertIsNone(await ref.cast(1))
+    async def test_call_and_cast_flow(self) -> None:
+        actor = Recorder()
+        ref, _ = spawn(actor)
+        reply = await ref.call("ping")
+        self.assertEqual(reply, "PING")
+        await ref.cast("tick")
         await asyncio.sleep(0)
-        await join.cancel()
-        self.assertTrue(join.actor.cleaned)
+        ref.cancel()
+        await ref.wait()
+        self.assertEqual(actor.log, ["init", "call:ping", "cast:tick", "term"])
+
+    async def test_call_after_shutdown_reports_queue(self) -> None:
+        actor = Echo()
+        ref, _ = spawn(actor)
+        ref.cancel()
+        await ref.wait()
+        result = await ref.call(1)
+        self.assertIsInstance(result, QueueShutDown)
+
+    async def test_spawn_with_task_group_and_channel(self) -> None:
+        sender, receiver = mpmc_channel()
+        actor = Recorder()
+        async with asyncio.TaskGroup() as tg:
+            ref, task = spawn(actor, sender, receiver, task_group=tg)
+            await ref.cast("tick")
+            await asyncio.sleep(0)
+            ref.cancel()
+        self.assertTrue(task.done())
+        self.assertFalse(ref.is_alive())
+        self.assertIn("cast:tick", actor.log)
 
 
 if __name__ == "__main__":
