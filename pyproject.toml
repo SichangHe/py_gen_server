@@ -8,7 +8,7 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "aio-sync>=0.1.1",
+    "aio-sync>=0.2.0",
 ]
 
 [tool.pyright]
