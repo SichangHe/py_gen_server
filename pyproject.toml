@@ -1,5 +1,5 @@
 [project]
-name = "py-gen-server"
+name = "py_gen_server"
 version = "0.0.0"
 description = "Erlang-style generic server (GenServer) actors"
 readme = "README.md"
@@ -18,3 +18,8 @@ reportIncompatibleMethodOverride = "error"
 [build-system]
 requires = ["uv_build>=0.9.15,<0.10.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
