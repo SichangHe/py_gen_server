@@ -1,2 +1,2 @@
-ruff check --fix \
-    && basedpyright src/py_gen_server/
+uv tool run ruff check --fix \
+    && uv tool run basedpyright src/py_gen_server/

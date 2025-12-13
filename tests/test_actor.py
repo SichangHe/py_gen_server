@@ -1,74 +1,107 @@
 import asyncio
 import unittest
 from asyncio import QueueShutDown
+from dataclasses import dataclass
+from enum import Enum, auto
 
-from aio_sync.mpmc import mpmc_channel
-from py_gen_server import Actor, spawn
+from py_gen_server import Actor, ActorEnv, Msg
 
 
-class Recorder(Actor[str, str, str]):
+class PingOrBang(Enum):
+    Ping = auto()
+    Bang = auto()
+
+
+class PingOrPong(Enum):
+    Ping = auto()
+    Pong = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class Count:
+    counter: int
+
+
+type PongOrCount = str | Count
+
+
+class PingPongServer(Actor[PingOrPong, PingOrBang, PongOrCount]):
     def __init__(self) -> None:
-        super().__init__()
-        self.log: list[str] = []
+        self.counter = 0
 
-    async def init(self) -> None:
-        self.log.append("init")
+    async def init(self, _env: ActorEnv[PingOrPong, PingOrBang, PongOrCount]) -> None:
+        return
 
-    async def handle_call(self, msg: str) -> str | None:
-        self.log.append(f"call:{msg}")
-        return msg.upper()
+    async def handle_cast(
+        self,
+        msg: PingOrBang,
+        _env: ActorEnv[PingOrPong, PingOrBang, PongOrCount],
+    ) -> None:
+        if msg is PingOrBang.Bang:
+            raise ValueError("Received Bang! Blowing up.")
+        self.counter += 1
 
-    async def handle_cast(self, msg: str) -> str | None:
-        self.log.append(f"cast:{msg}")
-        return None
+    async def handle_call(
+        self,
+        msg: PingOrPong,
+        _env: ActorEnv[PingOrPong, PingOrBang, PongOrCount],
+        reply_sender,
+    ) -> None:
+        match msg:
+            case PingOrPong.Ping:
+                self.counter += 1
+                reply_sender.send("pong")
+            case PingOrPong.Pong:
+                reply_sender.send(Count(self.counter))
 
-    async def handle_info(self, msg: object) -> str | None:
-        self.log.append(f"info:{msg}")
-        return None
-
-    async def terminate(self) -> None:
-        self.log.append("term")
-
-
-class Echo(Actor[int, int, int]):
-    async def handle_call(self, msg: int) -> int | None:
-        return msg
-
-    async def handle_cast(self, msg: int) -> int | None:
-        return None
+    async def before_exit(
+        self,
+        run_result: Exception | None,
+        env: ActorEnv[PingOrPong, PingOrBang, PongOrCount],
+    ) -> Exception | None:
+        if run_result is None:
+            return None
+        messages: list[Msg[PingOrPong, PingOrBang, PongOrCount]] = []
+        while True:
+            try:
+                maybe_msg = env.msg_receiver.try_recv()
+            except QueueShutDown:
+                break
+            if maybe_msg is None:
+                break
+            messages.append(maybe_msg)
+        return RuntimeError(f"with error `{run_result!r}` and disregarded messages `{messages!r}`, ")
 
 
 class ActorTests(unittest.IsolatedAsyncioTestCase):
-    async def test_call_and_cast_flow(self) -> None:
-        actor = Recorder()
-        ref, _ = spawn(actor)
-        reply = await ref.call("ping")
-        self.assertEqual(reply, "PING")
-        await ref.cast("tick")
-        await asyncio.sleep(0)
-        ref.cancel()
-        await ref.wait()
-        self.assertEqual(actor.log, ["init", "call:ping", "cast:tick", "term"])
+    async def test_ping_pong(self) -> None:
+        server = PingPongServer()
+        server_ref = server.spawn()
+        assert server_ref.actor_task is not None
+        handle = server_ref.actor_task
+        _ = await server_ref.cast(PingOrBang.Ping)
+        pong = await server_ref.call(PingOrPong.Ping)
+        self.assertEqual(pong, "pong")
+        count = await server_ref.call(PingOrPong.Pong)
+        self.assertEqual(count, Count(2))
+        server_ref.cancel()
+        async with asyncio.timeout(0.1):
+            rr = await handle
+        self.assertIsNone(rr.exit_result)
 
-    async def test_call_after_shutdown_reports_queue(self) -> None:
-        actor = Echo()
-        ref, _ = spawn(actor)
-        ref.cancel()
-        await ref.wait()
-        result = await ref.call(1)
-        self.assertIsInstance(result, QueueShutDown)
-
-    async def test_spawn_with_task_group_and_channel(self) -> None:
-        sender, receiver = mpmc_channel()
-        actor = Recorder()
-        async with asyncio.TaskGroup() as tg:
-            ref, task = spawn(actor, sender, receiver, task_group=tg)
-            await ref.cast("tick")
-            await asyncio.sleep(0)
-            ref.cancel()
-        self.assertTrue(task.done())
-        self.assertFalse(ref.is_alive())
-        self.assertIn("cast:tick", actor.log)
+    async def test_ping_pong_bang(self) -> None:
+        server = PingPongServer()
+        server_ref = server.spawn()
+        assert server_ref.actor_task is not None
+        handle = server_ref.actor_task
+        _ = await server_ref.cast(PingOrBang.Bang)
+        with self.assertRaises(RuntimeError):
+            async with asyncio.timeout(0.1):
+                _ = await server_ref.call(PingOrPong.Ping)
+        server_ref.cancel()
+        async with asyncio.timeout(0.1):
+            rr = await handle
+        self.assertIsInstance(rr.exit_result, RuntimeError)
 
 
 if __name__ == "__main__":
