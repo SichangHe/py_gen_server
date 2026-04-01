@@ -1,6 +1,6 @@
 [project]
 name = "py_gen_server"
-version = "0.0.0"
+version = "0.0.1"
 description = "Erlang-style generic server (GenServer) actors"
 readme = "README.md"
 authors = [
