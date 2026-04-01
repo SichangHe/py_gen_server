@@ -1,6 +1,15 @@
 """Erlang-style generic server actors."""
 
-from .actor import Actor, ActorEnv, ActorRef, ActorRunResult, Msg, MsgCall, MsgCast
+from .actor import (
+    Actor,
+    ActorEnv,
+    ActorRef,
+    ActorRunResult,
+    Msg,
+    MsgCall,
+    MsgCast,
+    TrackedOneShotSender,
+)
 
 __all__ = [
     "Actor",
@@ -10,4 +19,5 @@ __all__ = [
     "Msg",
     "MsgCall",
     "MsgCast",
+    "TrackedOneShotSender",
 ]
